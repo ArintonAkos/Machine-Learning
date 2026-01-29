@@ -1,0 +1,8 @@
+[
+{
+  "directory": "/Users/arintonakos/Projects/Machine-Learning/torch-test/build",
+  "command": "/usr/bin/c++ -DUSE_C10D_GLOO -DUSE_DISTRIBUTED -DUSE_RPC -DUSE_TENSORPIPE -isystem /Users/arintonakos/Developer/libs/libtorch/include -isystem /Users/arintonakos/Developer/libs/libtorch/include/torch/csrc/api/include -std=gnu++17 -arch arm64 -o CMakeFiles/torch-test.dir/main.cpp.o -c /Users/arintonakos/Projects/Machine-Learning/torch-test/main.cpp",
+  "file": "/Users/arintonakos/Projects/Machine-Learning/torch-test/main.cpp",
+  "output": "CMakeFiles/torch-test.dir/main.cpp.o"
+}
+]
