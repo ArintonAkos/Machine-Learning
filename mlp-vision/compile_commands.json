@@ -1,0 +1,8 @@
+[
+{
+  "directory": "/Users/arintonakos/Projects/Machine-Learning/mlp-vision/build",
+  "command": "/usr/bin/c++ -DUSE_C10D_GLOO -DUSE_DISTRIBUTED -DUSE_RPC -DUSE_TENSORPIPE -isystem /Users/arintonakos/Developer/libs/libtorch/include -isystem /Users/arintonakos/Developer/libs/libtorch/include/torch/csrc/api/include -std=gnu++17 -arch arm64 -o CMakeFiles/mlp-vision.dir/main.cpp.o -c /Users/arintonakos/Projects/Machine-Learning/mlp-vision/main.cpp",
+  "file": "/Users/arintonakos/Projects/Machine-Learning/mlp-vision/main.cpp",
+  "output": "CMakeFiles/mlp-vision.dir/main.cpp.o"
+}
+]
