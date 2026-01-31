@@ -14,6 +14,36 @@
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "stb_image_write.h"
 
+#include <atomic>
+#include <condition_variable>
+#include <mutex>
+
+// --- BARRIER CLASS ---
+class Barrier {
+public:
+  explicit Barrier(std::size_t count)
+      : threshold(count), count(count), generation(0) {}
+
+  void wait() {
+    std::unique_lock<std::mutex> lock(mutex);
+    auto gen = generation;
+    if (--count == 0) {
+      generation++;
+      count = threshold;
+      cond.notify_all();
+    } else {
+      cond.wait(lock, [this, gen] { return gen != generation; });
+    }
+  }
+
+private:
+  std::mutex mutex;
+  std::condition_variable cond;
+  std::size_t threshold;
+  std::size_t count;
+  std::size_t generation;
+};
+
 namespace fs = std::filesystem;
 
 // --- SISD BLUR IMPLEMENTATION (Box Blur 3x3) ---
@@ -82,16 +112,16 @@ static inline uint8x8_t divide_by_3_u16(uint16x8_t sum) {
 }
 
 __attribute((noinline)) void
-process_blur_simd_vertical(const unsigned char *src, unsigned char *dst,
-                           int width, int height, int channels) {
+process_blur_simd_vertical_range(const unsigned char *src, unsigned char *dst,
+                                 int width, int height, int channels,
+                                 int y_start, int y_end) {
   int stride = width * channels;
   // Alpha data and mask
   uint8_t a_data[16] = {0, 0, 0, 255, 0, 0, 0, 255, 0, 0, 0, 255, 0, 0, 0, 255};
   uint8x16_t alpha_mask = vld1q_u8(a_data);
 
-  // First row
-
-  {
+  // 1. Handle first row (if in range)
+  if (y_start == 0) {
     const unsigned char *p_curr = src;         // 0. row
     const unsigned char *p_bot = src + stride; // 1. row
     unsigned char *p_out = dst;
@@ -106,56 +136,59 @@ process_blur_simd_vertical(const unsigned char *src, unsigned char *dst,
     }
   }
 
-  for (int y = 1; y < height - 1; y++) {
-    // Get pointers to the previous, current, and next rows
-    const unsigned char *p_top = src + (y - 1) * stride;
-    const unsigned char *p_mid = src + y * stride;
-    const unsigned char *p_bot = src + (y + 1) * stride;
-    unsigned char *p_out = dst + y * stride;
+  // 2. Handle inner rows
+  // Intersection of [y_start, y_end) and [1, height-1)
+  int inner_start = std::max(1, y_start);
+  int inner_end = std::min(height - 1, y_end);
 
-    int x = 0;
-    for (; x <= stride - 16; x += 16) {
-      // Get the top, middle, and bottom rows, 4 pixels per row, 4 channels each
-      uint8x16_t top = vld1q_u8(p_top + x);
-      uint8x16_t mid = vld1q_u8(p_mid + x);
-      uint8x16_t bot = vld1q_u8(p_bot + x);
+  if (inner_start < inner_end) {
+    for (int y = inner_start; y < inner_end; y++) {
+      // Get pointers to the previous, current, and next rows
+      const unsigned char *p_top = src + (y - 1) * stride;
+      const unsigned char *p_mid = src + y * stride;
+      const unsigned char *p_bot = src + (y + 1) * stride;
+      unsigned char *p_out = dst + y * stride;
 
-      // Since we add up 3 rows, we need to extend to 16 bits, since 255 + 255 +
-      // 255 = 765 > 255 To prevent the overflow, we handle the first 8 bits,
-      // and the last 8 bits separately The first 8 bits are the lower 8 bits of
-      // the 16 bit value The last 8 bits are the upper 8 bits of the 16 bit
-      // value
-      uint16x8_t sum_low = vaddl_u8(vget_low_u8(top), vget_low_u8(mid));
-      sum_low = vaddw_u8(sum_low, vget_low_u8(bot));
-      uint16x8_t sum_high = vaddl_u8(vget_high_u8(top), vget_high_u8(mid));
-      sum_high = vaddw_u8(sum_high, vget_high_u8(bot));
+      int x = 0;
+      for (; x <= stride - 16; x += 16) {
+        // Get the top, middle, and bottom rows, 4 pixels per row, 4 channels
+        // each
+        uint8x16_t top = vld1q_u8(p_top + x);
+        uint8x16_t mid = vld1q_u8(p_mid + x);
+        uint8x16_t bot = vld1q_u8(p_bot + x);
 
-      // Multiply by constant 21846 and shift right by 16 for higher precision
-      uint8x8_t res_low = divide_by_3_u16(sum_low);
-      uint8x8_t res_high = divide_by_3_u16(sum_high);
+        // Since we add up 3 rows, we need to extend to 16 bits
+        uint16x8_t sum_low = vaddl_u8(vget_low_u8(top), vget_low_u8(mid));
+        sum_low = vaddw_u8(sum_low, vget_low_u8(bot));
+        uint16x8_t sum_high = vaddl_u8(vget_high_u8(top), vget_high_u8(mid));
+        sum_high = vaddw_u8(sum_high, vget_high_u8(bot));
 
-      // Combine the results
+        // Multiply by constant 21846 and shift right by 16 for higher precision
+        uint8x8_t res_low = divide_by_3_u16(sum_low);
+        uint8x8_t res_high = divide_by_3_u16(sum_high);
 
-      uint8x16_t res = vcombine_u8(res_low, res_high);
-      // Apply alpha mask
-      res = vorrq_u8(res, alpha_mask);
-      // Write the result to the output buffer
-      vst1q_u8(p_out + x, res);
-    }
-
-    // Handle the remaining pixels to the right
-    for (; x < stride; x += channels) {
-      for (int c = 0; c < 3; c++) { // Only RGB
-        // (Top + Current + Bottom) / 3
-        int sum = p_top[x + c] + p_mid[x + c] + p_bot[x + c];
-        p_out[x + c] = sum / 3;
+        // Combine the results
+        uint8x16_t res = vcombine_u8(res_low, res_high);
+        // Apply alpha mask
+        res = vorrq_u8(res, alpha_mask);
+        // Write the result to the output buffer
+        vst1q_u8(p_out + x, res);
       }
-      p_out[x + 3] = 255; // Alpha fix
+
+      // Handle the remaining pixels to the right
+      for (; x < stride; x += channels) {
+        for (int c = 0; c < 3; c++) { // Only RGB
+          // (Top + Current + Bottom) / 3
+          int sum = p_top[x + c] + p_mid[x + c] + p_bot[x + c];
+          p_out[x + c] = sum / 3;
+        }
+        p_out[x + 3] = 255; // Alpha fix
+      }
     }
   }
 
-  // Last row
-  {
+  // 3. Handle last row (if in range)
+  if (y_end == height) {
     const unsigned char *p_curr = src + (height - 1) * stride; // (N-1)th row
     const unsigned char *p_top = src + (height - 2) * stride;  // (N-2)th row
     unsigned char *p_out = dst + (height - 1) * stride;
@@ -172,18 +205,18 @@ process_blur_simd_vertical(const unsigned char *src, unsigned char *dst,
 }
 
 __attribute((noinline)) void
-process_blur_simd_horizontal(const unsigned char *src, unsigned char *dst,
-                             int width, int height, int channels) {
+process_blur_simd_horizontal_range(const unsigned char *src, unsigned char *dst,
+                                   int width, int height, int channels,
+                                   int y_start, int y_end) {
   int stride = width * channels;
   // Alpha data and mask
   uint8_t a_data[16] = {0, 0, 0, 255, 0, 0, 0, 255, 0, 0, 0, 255, 0, 0, 0, 255};
   uint8x16_t alpha_mask = vld1q_u8(a_data);
-  // Constants for the window size
 
   const int window_size = 4;
   const int window_size_bytes = window_size * channels;
 
-  for (int y = 0; y < height; y++) {
+  for (int y = y_start; y < y_end; y++) {
     // The ide aon the horizontal blur is the following:
     // 1. Load the left, middle and right pixels
     const unsigned char *p_src = src + y * stride;
@@ -270,16 +303,17 @@ __attribute__((noinline)) void process_blur_simd(const unsigned char *src,
                                                  int iterations) {
   std::vector<unsigned char> temp_buf(width * height * channels);
 
-  // Vertical blur (src -> temp_buf)
-  process_blur_simd_vertical(src, temp_buf.data(), width, height, channels);
-  // Horizontal blur (temp_buf -> dst)
-  process_blur_simd_horizontal(temp_buf.data(), dst, width, height, channels);
+  // Initial Pass
+  process_blur_simd_vertical_range(src, temp_buf.data(), width, height,
+                                   channels, 0, height);
+  process_blur_simd_horizontal_range(temp_buf.data(), dst, width, height,
+                                     channels, 0, height);
 
   for (int iter = 1; iter < iterations; iter++) {
-    // Vertical blur (dst -> temp_buf)
-    process_blur_simd_vertical(dst, temp_buf.data(), width, height, channels);
-    // Horizontal blur (temp_buf -> dst)
-    process_blur_simd_horizontal(temp_buf.data(), dst, width, height, channels);
+    process_blur_simd_vertical_range(dst, temp_buf.data(), width, height,
+                                     channels, 0, height);
+    process_blur_simd_horizontal_range(temp_buf.data(), dst, width, height,
+                                       channels, 0, height);
   }
 }
 
@@ -287,9 +321,50 @@ __attribute__((noinline)) void process_blur_simd(const unsigned char *src,
 void process_blur_multithreaded(const unsigned char *src, unsigned char *dst,
                                 int width, int height, int channels,
                                 int num_threads) {
-  //   std::vector<std::thread> threads;
-  //   std::atomic<int> completed_count{0};
-  //   int total_files = files.size();
+  std::vector<std::thread> threads;
+  Barrier barrier(num_threads);
+
+  // Temporary buffer for the whole image (shared across threads)
+  std::vector<unsigned char> temp_buf(width * height * channels);
+
+  // Range calculation per thread
+  int rows_per_thread = height / num_threads;
+  int remainder = height % num_threads;
+  int current_y = 0;
+
+  for (int t = 0; t < num_threads; ++t) {
+    int start_y = current_y;
+    int end_y = start_y + rows_per_thread + (t < remainder ? 1 : 0);
+    current_y = end_y;
+
+    threads.emplace_back([=, &barrier, &temp_buf]() {
+      int iterations = 50; // Hardcoded or passed as arg if we change sig
+
+      // Iteration 0: src -> temp -> dst
+      process_blur_simd_vertical_range(src, temp_buf.data(), width, height,
+                                       channels, start_y, end_y);
+      barrier.wait(); // Sync execution before Horizontal pass
+
+      process_blur_simd_horizontal_range(temp_buf.data(), dst, width, height,
+                                         channels, start_y, end_y);
+      barrier.wait(); // Sync execution before next iteration
+
+      // Iterations 1..N: dst -> temp -> dst
+      for (int iter = 1; iter < iterations; ++iter) {
+        process_blur_simd_vertical_range(dst, temp_buf.data(), width, height,
+                                         channels, start_y, end_y);
+        barrier.wait();
+
+        process_blur_simd_horizontal_range(temp_buf.data(), dst, width, height,
+                                           channels, start_y, end_y);
+        barrier.wait();
+      }
+    });
+  }
+
+  for (auto &t : threads) {
+    t.join();
+  }
 }
 
 void process_images_batch_mt(const std::vector<std::string> &files,
@@ -480,7 +555,7 @@ int main() {
             << std::endl;
   std::cout << "SIMD time:               " << total_simd_time << " ms"
             << std::endl;
-  std::cout << "MT time (TODO):          " << total_mt_time << " ms"
+  std::cout << "MT SIMD time (STRIPPED): " << total_mt_time << " ms"
             << std::endl;
   std::cout << "MT SIMD time (BATCH):    " << total_mt_simd_time << " ms"
             << std::endl;
@@ -491,8 +566,12 @@ int main() {
               << total_sisd_time / total_simd_time << "x" << std::endl;
     std::cout << "SPEEDUP (SIMD -> MT SIMD):   "
               << total_simd_time / total_mt_simd_time << "x" << std::endl;
+    std::cout << "SPEEDUP (SIMD -> MT STRIPPED):   "
+              << total_simd_time / total_mt_time << "x" << std::endl;
     std::cout << "TOTAL SPEEDUP (SISD -> MT):  "
               << total_sisd_time / total_mt_simd_time << "x" << std::endl;
+    std::cout << "TOTAL SPEEDUP (SISD -> MT STRIPPED):  "
+              << total_sisd_time / total_mt_time << "x" << std::endl;
   }
 
   return 0;
