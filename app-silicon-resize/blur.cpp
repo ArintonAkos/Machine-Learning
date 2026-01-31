@@ -111,6 +111,24 @@ static inline uint8x8_t divide_by_3_u16(uint16x8_t sum) {
   return vqmovun_s16(res_s16);
 }
 
+static inline uint8x16_t average_3_rows_u8(uint8x16_t top, uint8x16_t mid,
+                                           uint8x16_t bot) {
+  // Extend to 16 bits and add together (Lower half)
+  uint16x8_t sum_low = vaddl_u8(vget_low_u8(top), vget_low_u8(mid));
+  sum_low = vaddw_u8(sum_low, vget_low_u8(bot));
+
+  // Extend to 16 bits and add together (Upper half)
+  uint16x8_t sum_high = vaddl_u8(vget_high_u8(top), vget_high_u8(mid));
+  sum_high = vaddw_u8(sum_high, vget_high_u8(bot));
+
+  // Divide by 3
+  uint8x8_t res_low = divide_by_3_u16(sum_low);
+  uint8x8_t res_high = divide_by_3_u16(sum_high);
+
+  // Visszaalakítás 8 bites vektorrá
+  return vcombine_u8(res_low, res_high);
+}
+
 __attribute((noinline)) void
 process_blur_simd_vertical_range(const unsigned char *src, unsigned char *dst,
                                  int width, int height, int channels,
@@ -150,29 +168,39 @@ process_blur_simd_vertical_range(const unsigned char *src, unsigned char *dst,
       unsigned char *p_out = dst + y * stride;
 
       int x = 0;
-      for (; x <= stride - 16; x += 16) {
-        // Get the top, middle, and bottom rows, 4 pixels per row, 4 channels
+      for (; x <= stride - 64; x += 64) {
+        // Get the top, middle, and bottom rows, 16 pixels per row, 4 channels
         // each
+        uint8x16x4_t top = vld4q_u8(p_top + x);
+        uint8x16x4_t mid = vld4q_u8(p_mid + x);
+        uint8x16x4_t bot = vld4q_u8(p_bot + x);
+
+        uint8x16_t res_r =
+            average_3_rows_u8(top.val[0], mid.val[0], bot.val[0]);
+        uint8x16_t res_g =
+            average_3_rows_u8(top.val[1], mid.val[1], bot.val[1]);
+        uint8x16_t res_b =
+            average_3_rows_u8(top.val[2], mid.val[2], bot.val[2]);
+        uint8x16_t res_a = vdupq_n_u8(255);
+
+        uint8x16x4_t res = {res_r, res_g, res_b, res_a};
+        vst4q_u8(p_out + x, res);
+      }
+
+      // Smaller Cleanup Loop
+      for (; x <= stride - 16; x += 16) {
         uint8x16_t top = vld1q_u8(p_top + x);
         uint8x16_t mid = vld1q_u8(p_mid + x);
         uint8x16_t bot = vld1q_u8(p_bot + x);
 
-        // Since we add up 3 rows, we need to extend to 16 bits
         uint16x8_t sum_low = vaddl_u8(vget_low_u8(top), vget_low_u8(mid));
         sum_low = vaddw_u8(sum_low, vget_low_u8(bot));
         uint16x8_t sum_high = vaddl_u8(vget_high_u8(top), vget_high_u8(mid));
         sum_high = vaddw_u8(sum_high, vget_high_u8(bot));
 
-        // Multiply by constant 21846 and shift right by 16 for higher precision
-        uint8x8_t res_low = divide_by_3_u16(sum_low);
-        uint8x8_t res_high = divide_by_3_u16(sum_high);
-
-        // Combine the results
-        uint8x16_t res = vcombine_u8(res_low, res_high);
-        // Apply alpha mask
-        res = vorrq_u8(res, alpha_mask);
-        // Write the result to the output buffer
-        vst1q_u8(p_out + x, res);
+        uint8x16_t res =
+            vcombine_u8(divide_by_3_u16(sum_low), divide_by_3_u16(sum_high));
+        vst1q_u8(p_out + x, vorrq_u8(res, alpha_mask));
       }
 
       // Handle the remaining pixels to the right
@@ -213,9 +241,6 @@ process_blur_simd_horizontal_range(const unsigned char *src, unsigned char *dst,
   uint8_t a_data[16] = {0, 0, 0, 255, 0, 0, 0, 255, 0, 0, 0, 255, 0, 0, 0, 255};
   uint8x16_t alpha_mask = vld1q_u8(a_data);
 
-  const int window_size = 4;
-  const int window_size_bytes = window_size * channels;
-
   for (int y = y_start; y < y_end; y++) {
     // The ide aon the horizontal blur is the following:
     // 1. Load the left, middle and right pixels
@@ -226,30 +251,29 @@ process_blur_simd_horizontal_range(const unsigned char *src, unsigned char *dst,
     {
       int x = 0;
       for (int c = 0; c < 3; c++) {
-        int sum = p_src[x + c] + p_src[x + c] + p_src[x + c + channels];
+        int sum = p_src[x + c] + p_src[x + c] + p_src[x + c + 4];
         p_dst[x + c] = sum / 3;
       }
       p_dst[x + 3] = 255;
     }
 
-    for (int x = 4; x < window_size_bytes; x += 4) {
+    for (int x = 4; x < 16; x += 4) {
       for (int c = 0; c < 3; c++) {
-        int sum = p_src[x - window_size + c] + p_src[x + c] +
-                  p_src[x + window_size + c];
+        int sum = p_src[x - 4 + c] + p_src[x + c] + p_src[x + 4 + c];
         p_dst[x + c] = sum / 3;
       }
       p_dst[x + 3] = 255;
     }
 
-    int x = window_size_bytes;
+    int x = 16;
     // First 4 pixels (4 pixels * 4 channels = 16 bytes)
     uint8x16_t prev = vld1q_u8(p_src);
     // Next 4 pixels (4 pixels * 4 channels = 16 bytes)
-    uint8x16_t curr = vld1q_u8(p_src + window_size_bytes);
+    uint8x16_t curr = vld1q_u8(p_src + 16);
 
-    for (; x <= stride - (window_size_bytes * 2); x += window_size_bytes) {
+    for (; x <= stride - 32; x += 16) {
       // Next 4 pixels (4 pixels * 4 channels = 16 bytes)
-      uint8x16_t next = vld1q_u8(p_src + x + window_size_bytes);
+      uint8x16_t next = vld1q_u8(p_src + x + 16);
 
       // Skip 12 bytes from prev and take 4 bytes from curr
       uint8x16_t left = vextq_u8(prev, curr, 12);
