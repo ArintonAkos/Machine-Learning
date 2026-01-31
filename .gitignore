@@ -2,3 +2,9 @@
 build
 .cache
 *.dSYM
+dataset
+output_images
+benchmark
+benchmark_batch
+input_check.png
+output_gray.png
