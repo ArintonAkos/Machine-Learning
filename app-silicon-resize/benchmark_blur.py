@@ -7,6 +7,7 @@ import numpy as np
 # Settings
 INPUT_FOLDER = "dataset"
 ITERATIONS = 50
+SAMPLE_SIZE = 109
 KERNEL_SIZE = (3, 3) # 3x3 Box Blur
 
 def run_benchmark():
@@ -65,17 +66,17 @@ def run_benchmark():
         total_time_ms += (end - start) * 1000
 
         # Save first image for verification
-        if i == 0:
+        if "108.png" in filepath:
             os.makedirs("output_python", exist_ok=True)
             cv2.imwrite("output_python/opencv_result.png", processed)
             print("First image saved: output_python/opencv_result.png")
 
-        # Only measure the first 10 images, like in C++
-        if i == 9:
+        # Only measure the first SAMPLE_SIZE images, like in C++
+        if i == SAMPLE_SIZE - 1:
             break
 
     print("-" * 50)
-    print(f"RESULTS ({min(len(files), 10)} images):")
+    print(f"RESULTS ({min(len(files), SAMPLE_SIZE)} images):")
     print(f"Total pixels:      {total_pixels / 1_000_000:.4f} Megapixel")
     print(f"OpenCV time:       {total_time_ms:.2f} ms")
     print("-" * 50)

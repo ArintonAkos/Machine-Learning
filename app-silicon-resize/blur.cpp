@@ -474,7 +474,7 @@ int main() {
   }
 
   const int ITERATIONS = 50;
-  const int SAMPLE_SIZE = 10;
+  const int SAMPLE_SIZE = 109;
 
   std::vector<std::string> batch_files;
   int limit = std::min(SAMPLE_SIZE, static_cast<int>(image_files.size()));
@@ -519,8 +519,8 @@ int main() {
 
     // --- MEASUREMENT 1: SISD ---
     auto start = std::chrono::high_resolution_clock::now();
-    process_blur_sisd(src_data.data(), dst_sisd.data(), w, h, proc_channels,
-                      ITERATIONS);
+    // process_blur_sisd(src_data.data(), dst_sisd.data(), w, h, proc_channels,
+    //                   ITERATIONS);
     auto end = std::chrono::high_resolution_clock::now();
     total_sisd_time +=
         std::chrono::duration<double, std::milli>(end - start).count();
@@ -544,11 +544,11 @@ int main() {
         std::chrono::duration<double, std::milli>(end - start).count();
 
     // Save the first image for verification (SISD result)
-    if (count == 0) {
+    if (filepath.find("108") != std::string::npos) {
       std::string out_path = output_folder + "/blur_result_sisd.png";
-      stbi_write_png(out_path.c_str(), w, h, proc_channels, dst_sisd.data(),
-                     w * proc_channels);
-      std::cout << "First image saved (SISD): " << out_path << std::endl;
+      // stbi_write_png(out_path.c_str(), w, h, proc_channels, dst_sisd.data(),
+      //                w * proc_channels);
+      // std::cout << "First image saved (SISD): " << out_path << std::endl;
       out_path = output_folder + "/blur_result_simd.png";
       stbi_write_png(out_path.c_str(), w, h, proc_channels, dst_simd.data(),
                      w * proc_channels);
