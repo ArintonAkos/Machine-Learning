@@ -347,122 +347,126 @@ __attribute__((noinline)) void process_blur_simd(const unsigned char *src,
   }
 }
 
-void blur_horizontal_row_neon(const unsigned char *src_row,
-                              unsigned char *dst_row, int width, int height,
-                              int channels, int y_start, int y_end) {
+void blur_horizontal_range_neon(const unsigned char *src, unsigned char *dst,
+                                int width, int height, int channels,
+                                int y_start, int y_end) {
   int stride = width * channels;
-
   int radius = 2;
 
-  // Left boundary
-  for (int x = 0; x < radius; ++x) {
-    for (int c = 0; c < channels; ++c) {
-      dst_row[x * channels + c] = src_row[x * channels + c];
-    }
-  }
-
-  // Right boundary
-  for (int x = width - radius; x < width; ++x) {
-    for (int c = 0; c < channels; ++c) {
-      dst_row[x * channels + c] = src_row[x * channels + c];
-    }
-  }
-
-  // Boundary values
-  int x_start = radius;
-  int x_end = width - radius;
-  int vec_limit = x_end - ((x_end - x_start) % 4);
   // Constants for 5 kernel size weights
   uint16x8_t k4 = vdupq_n_u16(4);
   uint16x8_t k6 = vdupq_n_u16(6);
   uint16x8_t kRound = vdupq_n_u16(8);
 
-  // Main pass
-  for (int x = x_start; x < vec_limit; x += 4) {
-    int idx = x * channels;
+  // Iterate over the vertical range provided (Y axis)
+  for (int y = y_start; y < y_end; ++y) {
 
-    // P[x - 2]
-    uint8x16_t p_m2 = vld1q_u8(src_row + idx - 2 * channels);
-    // P[x - 1]
-    uint8x16_t p_m1 = vld1q_u8(src_row + idx - 1 * channels);
-    // P[x]
-    uint8x16_t p_0 = vld1q_u8(src_row + idx + 0 * channels);
-    // P[x + 1]
-    uint8x16_t p_p1 = vld1q_u8(src_row + idx + 1 * channels);
-    // P[x + 2]
-    uint8x16_t p_p2 = vld1q_u8(src_row + idx + 2 * channels);
+    // Calculate pointers to the start of the current row
+    const unsigned char *src_row = src + (y * stride);
+    unsigned char *dst_row = dst + (y * stride);
 
-    // Convert to 16 bit since 5 * 255 can overflow to more than 8 bits
-    uint16x8_t m2_L = vmovl_u8(vget_low_u8(p_m2));
-    uint16x8_t m2_H = vmovl_u8(vget_high_u8(p_m2));
+    // 1. Handle Left Boundary
+    // We cannot read x-2 at x=0, so we just copy the pixel
+    for (int x = 0; x < radius; ++x) {
+      for (int c = 0; c < channels; ++c) {
+        dst_row[x * channels + c] = src_row[x * channels + c];
+      }
+    }
 
-    uint16x8_t m1_L = vmovl_u8(vget_low_u8(p_m1));
-    uint16x8_t m1_H = vmovl_u8(vget_high_u8(p_m1));
+    // 2. Handle Right Boundary
+    // We cannot read x+2 at the edge, so we copy here as well
+    for (int x = width - radius; x < width; ++x) {
+      for (int c = 0; c < channels; ++c) {
+        dst_row[x * channels + c] = src_row[x * channels + c];
+      }
+    }
 
-    uint16x8_t m0_L = vmovl_u8(vget_low_u8(p_0));
-    uint16x8_t m0_H = vmovl_u8(vget_high_u8(p_0));
+    // 3. Main NEON Pass
+    int x_start = radius;
+    int x_end = width - radius;
+    // Align vector limit to 4 pixels (16 bytes for RGBA)
+    int vec_limit = x_end - ((x_end - x_start) % 4);
 
-    uint16x8_t p1_L = vmovl_u8(vget_low_u8(p_p1));
-    uint16x8_t p1_H = vmovl_u8(vget_high_u8(p_p1));
+    for (int x = x_start; x < vec_limit; x += 4) {
+      int idx = x * channels;
 
-    uint16x8_t p2_L = vmovl_u8(vget_low_u8(p_p2));
-    uint16x8_t p2_H = vmovl_u8(vget_high_u8(p_p2));
+      // Load neighborhood pixels
+      // P[x - 2]
+      uint8x16_t p_m2 = vld1q_u8(src_row + idx - 2 * channels);
+      // P[x - 1]
+      uint8x16_t p_m1 = vld1q_u8(src_row + idx - 1 * channels);
+      // P[x]
+      uint8x16_t p_0 = vld1q_u8(src_row + idx + 0 * channels);
+      // P[x + 1]
+      uint8x16_t p_p1 = vld1q_u8(src_row + idx + 1 * channels);
+      // P[x + 2]
+      uint8x16_t p_p2 = vld1q_u8(src_row + idx + 2 * channels);
 
-    // Summarize: Sum = 1 * P[x-2] + 4 * P[x-1] + 6 * P[x] + 4 * P[x+1] + 1 *
-    // P[x+2]
-    uint16x8_t sum_L = kRound;
-    uint16x8_t sum_H = kRound;
+      // Convert to 16 bit (Low and High halves)
+      uint16x8_t m2_L = vmovl_u8(vget_low_u8(p_m2));
+      uint16x8_t m2_H = vmovl_u8(vget_high_u8(p_m2));
 
-    // + 1 * m2
-    sum_L = vaddq_u16(sum_L, m2_L);
-    sum_H = vaddq_u16(sum_H, m2_H);
+      uint16x8_t m1_L = vmovl_u8(vget_low_u8(p_m1));
+      uint16x8_t m1_H = vmovl_u8(vget_high_u8(p_m1));
 
-    // + 1 * p2
-    sum_L = vaddq_u16(sum_L, p2_L);
-    sum_H = vaddq_u16(sum_H, p2_H);
+      uint16x8_t m0_L = vmovl_u8(vget_low_u8(p_0));
+      uint16x8_t m0_H = vmovl_u8(vget_high_u8(p_0));
 
-    // + 4 * m1
-    sum_L = vmlaq_u16(sum_L, m1_L, k4);
-    sum_H = vmlaq_u16(sum_H, m1_H, k4);
+      uint16x8_t p1_L = vmovl_u8(vget_low_u8(p_p1));
+      uint16x8_t p1_H = vmovl_u8(vget_high_u8(p_p1));
 
-    // + 4 * p1
-    sum_L = vmlaq_u16(sum_L, p1_L, k4);
-    sum_H = vmlaq_u16(sum_H, p1_H, k4);
+      uint16x8_t p2_L = vmovl_u8(vget_low_u8(p_p2));
+      uint16x8_t p2_H = vmovl_u8(vget_high_u8(p_p2));
 
-    // + 6 * m0
-    sum_L = vmlaq_u16(sum_L, m0_L, k6);
-    sum_H = vmlaq_u16(sum_H, m0_H, k6);
+      // Weighted Sum: 1*m2 + 4*m1 + 6*0 + 4*p1 + 1*p2
+      // Initialize with rounding constant (8)
+      uint16x8_t sum_L = kRound;
+      uint16x8_t sum_H = kRound;
 
-    // Bitshift right by 4
-    sum_L = vshrq_n_u16(sum_L, 4);
-    sum_H = vshrq_n_u16(sum_H, 4);
+      // + 1 * m2
+      sum_L = vaddq_u16(sum_L, m2_L);
+      sum_H = vaddq_u16(sum_H, m2_H);
 
-    // Convert back to 8 bit
-    uint8x8_t res_L = vmovn_u16(sum_L);
-    uint8x8_t res_H = vmovn_u16(sum_H);
+      // + 1 * p2
+      sum_L = vaddq_u16(sum_L, p2_L);
+      sum_H = vaddq_u16(sum_H, p2_H);
 
-    // Store the result
-    vst1q_u8(dst_row + idx, vcombine_u8(res_L, res_H));
-  }
+      // + 4 * m1
+      sum_L = vmlaq_u16(sum_L, m1_L, k4);
+      sum_H = vmlaq_u16(sum_H, m1_H, k4);
 
-  // Leftover pixels
-  for (int x = vec_limit; x < x_end; ++x) {
-    int idx = x * 4;
-    // For each channel : R, G, B, A
-    for (int c = 0; c < channels; ++c) {
-      uint32_t sum = 8; // Rounding
-      // Since we biteshift to right by 4,
-      // if we add 8 to the 16 max value, we get 24
-      // So, if we have 7 (which should be rounded down to 0), we get 15
-      // 15 >> 4 = 0
-      // If we have 8 (which should be rounded up to 1), we get 16
-      // 16 >> 4 = 1
-      sum += 1 * src_row[idx - 8 + c];
-      sum += 4 * src_row[idx - 4 + c];
-      sum += 6 * src_row[idx + 0 + c];
-      sum += 4 * src_row[idx + 4 + c];
-      sum += 1 * src_row[idx + 8 + c];
-      dst_row[idx + c] = (unsigned char)(sum >> 4);
+      // + 4 * p1
+      sum_L = vmlaq_u16(sum_L, p1_L, k4);
+      sum_H = vmlaq_u16(sum_H, p1_H, k4);
+
+      // + 6 * m0
+      sum_L = vmlaq_u16(sum_L, m0_L, k6);
+      sum_H = vmlaq_u16(sum_H, m0_H, k6);
+
+      // Normalize: Bitshift right by 4 (division by 16)
+      sum_L = vshrq_n_u16(sum_L, 4);
+      sum_H = vshrq_n_u16(sum_H, 4);
+
+      // Convert back to 8 bit and store
+      uint8x8_t res_L = vmovn_u16(sum_L);
+      uint8x8_t res_H = vmovn_u16(sum_H);
+      vst1q_u8(dst_row + idx, vcombine_u8(res_L, res_H));
+    }
+
+    // 4. Handle Leftover pixels (Scalar fallback)
+    for (int x = vec_limit; x < x_end; ++x) {
+      int idx = x * channels;
+      for (int c = 0; c < channels; ++c) {
+        uint32_t sum = 8; // Rounding
+
+        sum += 1 * src_row[idx - 8 + c]; // x-2
+        sum += 4 * src_row[idx - 4 + c]; // x-1
+        sum += 6 * src_row[idx + 0 + c]; // x
+        sum += 4 * src_row[idx + 4 + c]; // x+1
+        sum += 1 * src_row[idx + 8 + c]; // x+2
+
+        dst_row[idx + c] = (unsigned char)(sum >> 4);
+      }
     }
   }
 }
@@ -485,15 +489,15 @@ void blur_vertical_range_row_neon(const unsigned char *src, unsigned char *dst,
   // Left boundary
   for (int y = safe_start; y < safe_end; ++y) {
     // Current line - 2
-    const unsigned char *r_m2 = src + (y - radius) * stride;
+    const unsigned char *r_m2 = src + (y - 2) * stride;
     // Current line - 1
-    const unsigned char *r_m1 = src + (y - radius + 1) * stride;
+    const unsigned char *r_m1 = src + (y - 1) * stride;
     // Current line
-    const unsigned char *r_0 = src + (y - radius + 2) * stride;
+    const unsigned char *r_0 = src + (y)*stride;
     // Current line + 1
-    const unsigned char *r_p1 = src + (y + radius + 1) * stride;
+    const unsigned char *r_p1 = src + (y + 1) * stride;
     // Current line + 2
-    const unsigned char *r_p2 = src + (y + radius) * stride;
+    const unsigned char *r_p2 = src + (y + 2) * stride;
 
     unsigned char *dst_row = dst + y * stride;
 
@@ -567,57 +571,70 @@ void blur_vertical_range_row_neon(const unsigned char *src, unsigned char *dst,
       sum += 6 * r_0[x];
       sum += 4 * r_p1[x];
       sum += 1 * r_p2[x];
-      dst[x] = (unsigned char)(sum >> 4);
+      dst_row[x] = (unsigned char)(sum >> 4);
     }
   }
 }
 
 void process_blur_gaussian(const unsigned char *src, unsigned char *dst,
-                           int width, int height, int channels, float sigma) {
+                           int width, int height, int channels, int iterations,
+                           int num_threads = -1) {
   // Create temp buffer for horizontal pass
   std::vector<unsigned char> temp(width * height * channels);
+  int stride = width * channels;
 
   // Horizontal pass
-  int num_threads = std::thread::hardware_concurrency();
-  std::vector<std::thread> threads;
+  if (num_threads == -1) {
+    num_threads = std::thread::hardware_concurrency();
+  }
   int rows_per_thread = height / num_threads;
-  for (int t = 0; t < num_threads; ++t) {
-    int y_start = t * rows_per_thread;
-    int y_end = (t == num_threads - 1) ? height : y_start + rows_per_thread;
 
-    threads.emplace_back([=, &temp]() {
-      for (int y = y_start; y < y_end; ++y) {
-        const unsigned char *s = src + y * width * channels;
-        unsigned char *d = temp.data() + y * width * channels;
-        blur_horizontal_row_neon(s, d, width, height, channels, y_start, y_end);
-      }
-    });
-  }
+  for (int i = 0; i < iterations; ++i) {
+    const unsigned char *current_input = (i == 0) ? src : dst;
+    std::vector<std::thread> threads;
 
-  for (auto &t : threads)
-    t.join();
-  threads.clear();
+    for (int t = 0; t < num_threads; ++t) {
+      int y_start = t * rows_per_thread;
+      int y_end = (t == num_threads - 1) ? height : y_start + rows_per_thread;
 
-  // Vertical pass
-  for (int t = 0; t < num_threads; ++t) {
-    int y_start = t * rows_per_thread;
-    int y_end = (t == num_threads) ? height : y_start + rows_per_thread;
+      threads.emplace_back([=, &temp]() {
+        blur_horizontal_range_neon(current_input, temp.data(), width, height,
+                                   channels, y_start, y_end);
+      });
+    }
 
-    threads.emplace_back([=, &temp]() {
-      blur_vertical_range_row_neon(temp.data(), dst, width, height, channels,
-                                   y_start, y_end);
-    });
-  }
+    // Join threads
+    for (auto &t : threads) {
+      t.join();
+    }
 
-  for (auto &t : threads)
-    t.join();
-  threads.clear();
+    // Clear threads
+    threads.clear();
 
-  int stride = width * channels;
-  if (height > 4) {
-    std::memcpy(dst, temp.data(), stride * 2);
-    std::memcpy(dst + stride * (height - 2),
-                temp.data() + stride * (height - 2), stride * 2);
+    // // Vertical pass
+    for (int t = 0; t < num_threads; ++t) {
+      int y_start = t * rows_per_thread;
+      int y_end = (t == num_threads - 1) ? height : y_start + rows_per_thread;
+
+      threads.emplace_back([=, &temp]() {
+        blur_vertical_range_row_neon(temp.data(), dst, width, height, channels,
+                                     y_start, y_end);
+      });
+    }
+
+    // Join threads
+    for (auto &t : threads) {
+      t.join();
+    }
+
+    // Clear threads
+    threads.clear();
+
+    if (height > 4) {
+      std::memcpy(dst, temp.data(), stride * 2);
+      std::memcpy(dst + stride * (height - 2),
+                  temp.data() + stride * (height - 2), stride * 2);
+    }
   }
 }
 
@@ -755,6 +772,7 @@ int main() {
 
   const int ITERATIONS = 50;
   const int SAMPLE_SIZE = 110;
+  const int THREADS = 4;
   // If process files is not empty, use it. Otherwise, use the first SAMPLE_SIZE
   // images from the dataset.
   std::vector<std::string> process_files = {"image_109.png"};
@@ -831,7 +849,7 @@ int main() {
     // Currently empty, or fallback, but measure the call
     start = std::chrono::high_resolution_clock::now();
     process_blur_multithreaded(src_data.data(), dst_mt.data(), w, h,
-                               proc_channels, 4); // 4 threads
+                               proc_channels, THREADS); // 4 threads
     end = std::chrono::high_resolution_clock::now();
     total_mt_time +=
         std::chrono::duration<double, std::milli>(end - start).count();
@@ -839,7 +857,7 @@ int main() {
     // --- MEASUREMENT 5: GAUSSIAN ---
     start = std::chrono::high_resolution_clock::now();
     process_blur_gaussian(src_data.data(), dst_gaussian.data(), w, h,
-                          proc_channels, 4); // 4 threads
+                          proc_channels, ITERATIONS, 1);
     end = std::chrono::high_resolution_clock::now();
     total_gaussian_time +=
         std::chrono::duration<double, std::milli>(end - start).count();
