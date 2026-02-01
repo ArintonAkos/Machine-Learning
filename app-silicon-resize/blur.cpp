@@ -351,12 +351,16 @@ void blur_horizontal_range_neon(const unsigned char *src, unsigned char *dst,
                                 int width, int height, int channels,
                                 int y_start, int y_end) {
   int stride = width * channels;
-  int radius = 2;
+  int radius = 5;
 
-  // Constants for 5 kernel size weights
+  // Constants for kernel 11 weights: [1, 4, 12, 26, 48, 74, 48, 26, 12, 4, 1]
   uint16x8_t k4 = vdupq_n_u16(4);
-  uint16x8_t k6 = vdupq_n_u16(6);
-  uint16x8_t kRound = vdupq_n_u16(8);
+  uint16x8_t k12 = vdupq_n_u16(12);
+  uint16x8_t k26 = vdupq_n_u16(26);
+  uint16x8_t k48 = vdupq_n_u16(48);
+  uint16x8_t k74 = vdupq_n_u16(74);
+  // Use 128 for rounding, bitshift 8
+  uint16x8_t kRound = vdupq_n_u16(128);
 
   // Iterate over the vertical range provided (Y axis)
   for (int y = y_start; y < y_end; ++y) {
@@ -390,82 +394,91 @@ void blur_horizontal_range_neon(const unsigned char *src, unsigned char *dst,
     for (int x = x_start; x < vec_limit; x += 4) {
       int idx = x * channels;
 
-      // Load neighborhood pixels
-      // P[x - 2]
-      uint8x16_t p_m2 = vld1q_u8(src_row + idx - 2 * channels);
-      // P[x - 1]
-      uint8x16_t p_m1 = vld1q_u8(src_row + idx - 1 * channels);
-      // P[x]
-      uint8x16_t p_0 = vld1q_u8(src_row + idx + 0 * channels);
-      // P[x + 1]
-      uint8x16_t p_p1 = vld1q_u8(src_row + idx + 1 * channels);
-      // P[x + 2]
-      uint8x16_t p_p2 = vld1q_u8(src_row + idx + 2 * channels);
-
-      // Convert to 16 bit (Low and High halves)
-      uint16x8_t m2_L = vmovl_u8(vget_low_u8(p_m2));
-      uint16x8_t m2_H = vmovl_u8(vget_high_u8(p_m2));
-
-      uint16x8_t m1_L = vmovl_u8(vget_low_u8(p_m1));
-      uint16x8_t m1_H = vmovl_u8(vget_high_u8(p_m1));
-
-      uint16x8_t m0_L = vmovl_u8(vget_low_u8(p_0));
-      uint16x8_t m0_H = vmovl_u8(vget_high_u8(p_0));
-
-      uint16x8_t p1_L = vmovl_u8(vget_low_u8(p_p1));
-      uint16x8_t p1_H = vmovl_u8(vget_high_u8(p_p1));
-
-      uint16x8_t p2_L = vmovl_u8(vget_low_u8(p_p2));
-      uint16x8_t p2_H = vmovl_u8(vget_high_u8(p_p2));
-
-      // Weighted Sum: 1*m2 + 4*m1 + 6*0 + 4*p1 + 1*p2
-      // Initialize with rounding constant (8)
       uint16x8_t sum_L = kRound;
       uint16x8_t sum_H = kRound;
 
-      // + 1 * m2
-      sum_L = vaddq_u16(sum_L, m2_L);
-      sum_H = vaddq_u16(sum_H, m2_H);
+      {
+        // idx - 5*4 = idx - 20
+        uint8x16_t p_left = vld1q_u8(src_row + idx - 20);
+        uint16x8_t p_right = vld1q_u8(src_row + idx + 20);
 
-      // + 1 * p2
-      sum_L = vaddq_u16(sum_L, p2_L);
-      sum_H = vaddq_u16(sum_H, p2_H);
+        sum_L = vaddq_u16(sum_L, vmovl_u8(vget_low_u8(p_left)));
+        sum_H = vaddq_u16(sum_H, vmovl_u8(vget_high_u8(p_left)));
+        sum_L = vaddq_u16(sum_L, vmovl_u8(vget_low_u8(p_right)));
+        sum_H = vaddq_u16(sum_H, vmovl_u8(vget_high_u8(p_right)));
+      }
 
-      // + 4 * m1
-      sum_L = vmlaq_u16(sum_L, m1_L, k4);
-      sum_H = vmlaq_u16(sum_H, m1_H, k4);
+      {
+        // idx - 4*4 = idx - 16
+        uint8x16_t p_left = vld1q_u8(src_row + idx - 16);
+        uint16x8_t p_right = vld1q_u8(src_row + idx + 16);
 
-      // + 4 * p1
-      sum_L = vmlaq_u16(sum_L, p1_L, k4);
-      sum_H = vmlaq_u16(sum_H, p1_H, k4);
+        sum_L = vmlaq_u16(sum_L, vmovl_u8(vget_low_u8(p_left)), k4);
+        sum_H = vmlaq_u16(sum_H, vmovl_u8(vget_high_u8(p_left)), k4);
+        sum_L = vmlaq_u16(sum_L, vmovl_u8(vget_low_u8(p_right)), k4);
+        sum_H = vmlaq_u16(sum_H, vmovl_u8(vget_high_u8(p_right)), k4);
+      }
 
-      // + 6 * m0
-      sum_L = vmlaq_u16(sum_L, m0_L, k6);
-      sum_H = vmlaq_u16(sum_H, m0_H, k6);
+      {
+        // idx - 3*4 = idx - 12
+        uint8x16_t p_left = vld1q_u8(src_row + idx - 12);
+        uint16x8_t p_right = vld1q_u8(src_row + idx + 12);
 
-      // Normalize: Bitshift right by 4 (division by 16)
-      sum_L = vshrq_n_u16(sum_L, 4);
-      sum_H = vshrq_n_u16(sum_H, 4);
+        sum_L = vmlaq_u16(sum_L, vmovl_u8(vget_low_u8(p_left)), k12);
+        sum_H = vmlaq_u16(sum_H, vmovl_u8(vget_high_u8(p_left)), k12);
+        sum_L = vmlaq_u16(sum_L, vmovl_u8(vget_low_u8(p_right)), k12);
+        sum_H = vmlaq_u16(sum_H, vmovl_u8(vget_high_u8(p_right)), k12);
+      }
 
-      // Convert back to 8 bit and store
-      uint8x8_t res_L = vmovn_u16(sum_L);
-      uint8x8_t res_H = vmovn_u16(sum_H);
-      vst1q_u8(dst_row + idx, vcombine_u8(res_L, res_H));
+      {
+        // idx - 2*4 = idx - 8
+        uint8x16_t p_left = vld1q_u8(src_row + idx - 8);
+        uint16x8_t p_right = vld1q_u8(src_row + idx + 8);
+
+        sum_L = vmlaq_u16(sum_L, vmovl_u8(vget_low_u8(p_left)), k26);
+        sum_H = vmlaq_u16(sum_H, vmovl_u8(vget_high_u8(p_left)), k26);
+        sum_L = vmlaq_u16(sum_L, vmovl_u8(vget_low_u8(p_right)), k26);
+        sum_H = vmlaq_u16(sum_H, vmovl_u8(vget_high_u8(p_right)), k26);
+      }
+
+      {
+        // idx - 1*4 = idx - 4
+        uint8x16_t p_left = vld1q_u8(src_row + idx - 4);
+        uint16x8_t p_right = vld1q_u8(src_row + idx + 4);
+
+        sum_L = vmlaq_u16(sum_L, vmovl_u8(vget_low_u8(p_left)), k48);
+        sum_H = vmlaq_u16(sum_H, vmovl_u8(vget_high_u8(p_left)), k48);
+        sum_L = vmlaq_u16(sum_L, vmovl_u8(vget_low_u8(p_right)), k48);
+        sum_H = vmlaq_u16(sum_H, vmovl_u8(vget_high_u8(p_right)), k48);
+      }
+
+      {
+        // idx - 0*4 = idx
+        uint8x16_t p_center = vld1q_u8(src_row + idx);
+        sum_L = vmlaq_u16(sum_L, vmovl_u8(vget_low_u8(p_center)), k74);
+        sum_H = vmlaq_u16(sum_H, vmovl_u8(vget_high_u8(p_center)), k74);
+      }
+
+      // Normalize by dividing by 256 (shift right by 8)
+      sum_L = vshrq_n_u16(sum_L, 8);
+      sum_H = vshrq_n_u16(sum_H, 8);
+
+      vst1q_u8(dst_row + idx,
+               vcombine_u8(vqmovn_u16(sum_L), vqmovn_u16(sum_H)));
     }
 
-    // 4. Handle Leftover pixels (Scalar fallback)
+    // Handle Leftover pixels (Scalar fallback)
     for (int x = vec_limit; x < x_end; ++x) {
       int idx = x * channels;
       for (int c = 0; c < channels; ++c) {
-        uint32_t sum = 8; // Rounding
-
-        sum += 1 * src_row[idx - 8 + c]; // x-2
-        sum += 4 * src_row[idx - 4 + c]; // x-1
-        sum += 6 * src_row[idx + 0 + c]; // x
-        sum += 4 * src_row[idx + 4 + c]; // x+1
-        sum += 1 * src_row[idx + 8 + c]; // x+2
-
-        dst_row[idx + c] = (unsigned char)(sum >> 4);
+        uint32_t sum = 128;                                          // Rounding
+        sum += 1 * (src_row[idx - 20 + c] + src_row[idx + 20 + c]);  // x-5, x+5
+        sum += 4 * (src_row[idx - 16 + c] + src_row[idx + 16 + c]);  // x-4, x+4
+        sum += 12 * (src_row[idx - 12 + c] + src_row[idx + 12 + c]); // x-3, x+3
+        sum += 26 * (src_row[idx - 8 + c] + src_row[idx + 8 + c]);   // x-2, x+2
+        sum += 48 * (src_row[idx - 4 + c] + src_row[idx + 4 + c]);   // x-1, x+1
+        sum += 74 * src_row[idx + c];                                // x
+        dst_row[idx + c] = (unsigned char)(sum >> 8);
       }
     }
   }
@@ -475,12 +488,16 @@ void blur_vertical_range_row_neon(const unsigned char *src, unsigned char *dst,
                                   int width, int height, int channels,
                                   int y_start, int y_end) {
   int stride = width * channels;
-  int radius = 2;
+  int radius = 5;
 
-  // Constants for 5 kernel size weights
+  // Constants for kernel 11 weights: [1, 4, 12, 26, 48, 74, 48, 26, 12, 4, 1]
   uint16x8_t k4 = vdupq_n_u16(4);
-  uint16x8_t k6 = vdupq_n_u16(6);
-  uint16x8_t kRound = vdupq_n_u16(8);
+  uint16x8_t k12 = vdupq_n_u16(12);
+  uint16x8_t k26 = vdupq_n_u16(26);
+  uint16x8_t k48 = vdupq_n_u16(48);
+  uint16x8_t k74 = vdupq_n_u16(74);
+  // Use 128 for rounding, bitshift 8
+  uint16x8_t kRound = vdupq_n_u16(128);
 
   // Safe boundaries
   int safe_start = std::max(radius, y_start);
@@ -488,90 +505,104 @@ void blur_vertical_range_row_neon(const unsigned char *src, unsigned char *dst,
 
   // Left boundary
   for (int y = safe_start; y < safe_end; ++y) {
-    // Current line - 2
-    const unsigned char *r_m2 = src + (y - 2) * stride;
-    // Current line - 1
-    const unsigned char *r_m1 = src + (y - 1) * stride;
-    // Current line
-    const unsigned char *r_0 = src + (y)*stride;
-    // Current line + 1
-    const unsigned char *r_p1 = src + (y + 1) * stride;
-    // Current line + 2
-    const unsigned char *r_p2 = src + (y + 2) * stride;
-
     unsigned char *dst_row = dst + y * stride;
+    const unsigned char *src_ptrs[11];
+
+    for (int i = -5; i <= 5; i++) {
+      src_ptrs[i + 5] = src + (y + i) * stride;
+    }
 
     int x = 0;
     for (; x <= stride - 16; x += 16) {
-      // Fetch the next 4 pixels (each pixel has 4 channels) -> 4 * 4 = 16 bytes
-      uint8x16_t p_m2 = vld1q_u8(r_m2 + x);
-      uint8x16_t p_m1 = vld1q_u8(r_m1 + x);
-      uint8x16_t p_0 = vld1q_u8(r_0 + x);
-      uint8x16_t p_p1 = vld1q_u8(r_p1 + x);
-      uint8x16_t p_p2 = vld1q_u8(r_p2 + x);
-
-      // Convert to 16 bytes
-      uint16x8_t m2_L = vmovl_u8(vget_low_u8(p_m2));
-      uint16x8_t m2_H = vmovl_u8(vget_high_u8(p_m2));
-
-      uint16x8_t m1_L = vmovl_u8(vget_low_u8(p_m1));
-      uint16x8_t m1_H = vmovl_u8(vget_high_u8(p_m1));
-
-      uint16x8_t m0_L = vmovl_u8(vget_low_u8(p_0));
-      uint16x8_t m0_H = vmovl_u8(vget_high_u8(p_0));
-
-      uint16x8_t p1_L = vmovl_u8(vget_low_u8(p_p1));
-      uint16x8_t p1_H = vmovl_u8(vget_high_u8(p_p1));
-
-      uint16x8_t p2_L = vmovl_u8(vget_low_u8(p_p2));
-      uint16x8_t p2_H = vmovl_u8(vget_high_u8(p_p2));
-
-      // Summarize: Sum = 1 * P[x-2] + 4 * P[x-1] + 6 * P[x] + 4 * P[x+1] + 1 *
-      // P[x+2]
       uint16x8_t sum_L = kRound;
       uint16x8_t sum_H = kRound;
 
-      // + 1 * m2
-      sum_L = vaddq_u16(sum_L, m2_L);
-      sum_H = vaddq_u16(sum_H, m2_H);
+      {
+        // (y - 5, y + 5) - Weight: 1
+        uint8x16_t p_left = vld1q_u8(src_ptrs[0] + x);
+        uint8x16_t p_right = vld1q_u8(src_ptrs[10] + x);
 
-      // + 1 * p2
-      sum_L = vaddq_u16(sum_L, p2_L);
-      sum_H = vaddq_u16(sum_H, p2_H);
+        // Addition
+        sum_L = vaddq_u16(sum_L, vmovl_u8(vget_low_u8(p_left)));
+        sum_H = vaddq_u16(sum_H, vmovl_u8(vget_high_u8(p_left)));
+        sum_L = vaddq_u16(sum_L, vmovl_u8(vget_low_u8(p_right)));
+        sum_H = vaddq_u16(sum_H, vmovl_u8(vget_high_u8(p_right)));
+      }
 
-      // + 4 * m1
-      sum_L = vmlaq_u16(sum_L, m1_L, k4);
-      sum_H = vmlaq_u16(sum_H, m1_H, k4);
+      {
+        // (y - 4, y + 4) - Weight: 4
+        uint8x16_t p_left = vld1q_u8(src_ptrs[1] + x);
+        uint8x16_t p_right = vld1q_u8(src_ptrs[9] + x);
 
-      // + 4 * p1
-      sum_L = vmlaq_u16(sum_L, p1_L, k4);
-      sum_H = vmlaq_u16(sum_H, p1_H, k4);
+        // Addition
+        sum_L = vmlaq_u16(sum_L, vmovl_u8(vget_low_u8(p_left)), k4);
+        sum_H = vmlaq_u16(sum_H, vmovl_u8(vget_high_u8(p_left)), k4);
+        sum_L = vmlaq_u16(sum_L, vmovl_u8(vget_low_u8(p_right)), k4);
+        sum_H = vmlaq_u16(sum_H, vmovl_u8(vget_high_u8(p_right)), k4);
+      }
 
-      // + 6 * m0
-      sum_L = vmlaq_u16(sum_L, m0_L, k6);
-      sum_H = vmlaq_u16(sum_H, m0_H, k6);
+      {
+        // (y - 3, y + 3) - Weight: 12
+        uint8x16_t p_left = vld1q_u8(src_ptrs[2] + x);
+        uint8x16_t p_right = vld1q_u8(src_ptrs[8] + x);
 
-      // Normalize by right shifting by 4
-      sum_L = vshrq_n_u16(sum_L, 4);
-      sum_H = vshrq_n_u16(sum_H, 4);
+        // Addition
+        sum_L = vmlaq_u16(sum_L, vmovl_u8(vget_low_u8(p_left)), k12);
+        sum_H = vmlaq_u16(sum_H, vmovl_u8(vget_high_u8(p_left)), k12);
+        sum_L = vmlaq_u16(sum_L, vmovl_u8(vget_low_u8(p_right)), k12);
+        sum_H = vmlaq_u16(sum_H, vmovl_u8(vget_high_u8(p_right)), k12);
+      }
 
-      // Convert back to 8 bit
-      uint8x8_t res_L = vmovn_u16(sum_L);
-      uint8x8_t res_H = vmovn_u16(sum_H);
+      {
+        // (y - 2, y + 2) - Weight: 26
+        uint8x16_t p_left = vld1q_u8(src_ptrs[3] + x);
+        uint8x16_t p_right = vld1q_u8(src_ptrs[7] + x);
 
-      // Store the result
-      vst1q_u8(dst_row + x, vcombine_u8(res_L, res_H));
+        // Addition
+        sum_L = vmlaq_u16(sum_L, vmovl_u8(vget_low_u8(p_left)), k26);
+        sum_H = vmlaq_u16(sum_H, vmovl_u8(vget_high_u8(p_left)), k26);
+        sum_L = vmlaq_u16(sum_L, vmovl_u8(vget_low_u8(p_right)), k26);
+        sum_H = vmlaq_u16(sum_H, vmovl_u8(vget_high_u8(p_right)), k26);
+      }
+
+      {
+        // (y - 1, y + 1) - Weight: 48
+        uint8x16_t p_left = vld1q_u8(src_ptrs[4] + x);
+        uint8x16_t p_right = vld1q_u8(src_ptrs[6] + x);
+
+        // Addition
+        sum_L = vmlaq_u16(sum_L, vmovl_u8(vget_low_u8(p_left)), k48);
+        sum_H = vmlaq_u16(sum_H, vmovl_u8(vget_high_u8(p_left)), k48);
+        sum_L = vmlaq_u16(sum_L, vmovl_u8(vget_low_u8(p_right)), k48);
+        sum_H = vmlaq_u16(sum_H, vmovl_u8(vget_high_u8(p_right)), k48);
+      }
+
+      {
+        // (y) - Weight: 74
+        uint8x16_t p_center = vld1q_u8(src_ptrs[5] + x);
+
+        // Addition
+        sum_L = vmlaq_u16(sum_L, vmovl_u8(vget_low_u8(p_center)), k74);
+        sum_H = vmlaq_u16(sum_H, vmovl_u8(vget_high_u8(p_center)), k74);
+      }
+
+      sum_L = vshrq_n_u16(sum_L, 8);
+      sum_H = vshrq_n_u16(sum_H, 8);
+
+      vst1q_u8(dst_row + x, vcombine_u8(vqmovn_u16(sum_L), vqmovn_u16(sum_H)));
     }
 
     // Leftover pixels
     for (; x < stride; x++) {
-      uint32_t sum = 8; // Rounding
-      sum += 1 * r_m2[x];
-      sum += 4 * r_m1[x];
-      sum += 6 * r_0[x];
-      sum += 4 * r_p1[x];
-      sum += 1 * r_p2[x];
-      dst_row[x] = (unsigned char)(sum >> 4);
+      uint32_t sum = 128; // Rounding
+
+      sum += 1 * (src_ptrs[0][x] + src_ptrs[10][x]);
+      sum += 4 * (src_ptrs[1][x] + src_ptrs[9][x]);
+      sum += 12 * (src_ptrs[2][x] + src_ptrs[8][x]);
+      sum += 26 * (src_ptrs[3][x] + src_ptrs[7][x]);
+      sum += 48 * (src_ptrs[4][x] + src_ptrs[6][x]);
+      sum += 74 * src_ptrs[5][x];
+      dst_row[x] = (unsigned char)(sum >> 8);
     }
   }
 }
@@ -630,10 +661,11 @@ void process_blur_gaussian(const unsigned char *src, unsigned char *dst,
     // Clear threads
     threads.clear();
 
-    if (height > 4) {
-      std::memcpy(dst, temp.data(), stride * 2);
-      std::memcpy(dst + stride * (height - 2),
-                  temp.data() + stride * (height - 2), stride * 2);
+    int radius = 5;
+    if (height > radius * 2) {
+      std::memcpy(dst, temp.data(), stride * radius);
+      std::memcpy(dst + stride * (height - radius),
+                  temp.data() + stride * (height - radius), stride * radius);
     }
   }
 }
@@ -771,11 +803,11 @@ int main() {
   }
 
   const int ITERATIONS = 50;
-  const int SAMPLE_SIZE = 110;
+  const int SAMPLE_SIZE = 120;
   const int THREADS = 4;
   // If process files is not empty, use it. Otherwise, use the first SAMPLE_SIZE
   // images from the dataset.
-  std::vector<std::string> process_files = {"image_109.png"};
+  std::vector<std::string> process_files = {"image_110.png"};
 
   std::vector<std::string> batch_files;
   int limit = std::min(SAMPLE_SIZE, static_cast<int>(image_files.size()));
@@ -857,13 +889,13 @@ int main() {
     // --- MEASUREMENT 5: GAUSSIAN ---
     start = std::chrono::high_resolution_clock::now();
     process_blur_gaussian(src_data.data(), dst_gaussian.data(), w, h,
-                          proc_channels, ITERATIONS, 1);
+                          proc_channels, ITERATIONS, 4);
     end = std::chrono::high_resolution_clock::now();
     total_gaussian_time +=
         std::chrono::duration<double, std::milli>(end - start).count();
 
     // Save the first image for verification (SISD result)
-    if (filepath.find("109") != std::string::npos) {
+    if (filepath.find("110") != std::string::npos) {
       std::string out_path = output_folder + "/blur_result_sisd.png";
       // stbi_write_png(out_path.c_str(), w, h, proc_channels, dst_sisd.data(),
       //                w * proc_channels);
