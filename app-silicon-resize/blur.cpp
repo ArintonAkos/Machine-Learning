@@ -95,6 +95,10 @@ __attribute__((noinline)) void process_blur_sisd(const unsigned char *src,
 // Accuracy matches the slower 32-bit vmull version (21846 multiplier),
 // but runs in a single instruction without splitting.
 static inline uint8x8_t divide_by_3_u16(uint16x8_t sum) {
+  // Add 1 before the divsion, so it will be equivalent to (sum + 1) / 3
+  // This implements the rounding instead of a simple truncation.
+  sum = vaddq_u16(sum, vdupq_n_u16(1));
+
   // 10923 = ceil(65536 / 6).
   // Since the instruction duplicates (2*x*C), this effectively corresponds to a
   // 21846 multiplier.
@@ -474,7 +478,10 @@ int main() {
   }
 
   const int ITERATIONS = 50;
-  const int SAMPLE_SIZE = 109;
+  const int SAMPLE_SIZE = 110;
+  // If process files is not empty, use it. Otherwise, use the first SAMPLE_SIZE
+  // images from the dataset.
+  std::vector<std::string> process_files = {"image_109.png"};
 
   std::vector<std::string> batch_files;
   int limit = std::min(SAMPLE_SIZE, static_cast<int>(image_files.size()));
@@ -494,6 +501,13 @@ int main() {
 
   int count = 0;
   for (const auto &filepath : batch_files) {
+    if (!process_files.empty() &&
+        filepath.find(process_files[0]) == std::string::npos) {
+      continue;
+    }
+
+    std::cout << "Processing: " << filepath << std::endl;
+
     int w, h, channels;
     // Enforce 4 channels (RGBA) for easier alignment (padding)
     unsigned char *raw_img = stbi_load(filepath.c_str(), &w, &h, &channels, 4);
@@ -544,7 +558,7 @@ int main() {
         std::chrono::duration<double, std::milli>(end - start).count();
 
     // Save the first image for verification (SISD result)
-    if (filepath.find("108") != std::string::npos) {
+    if (filepath.find("109") != std::string::npos) {
       std::string out_path = output_folder + "/blur_result_sisd.png";
       // stbi_write_png(out_path.c_str(), w, h, proc_channels, dst_sisd.data(),
       //                w * proc_channels);
