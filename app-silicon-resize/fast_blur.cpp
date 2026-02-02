@@ -46,6 +46,98 @@ static inline uint8x16_t average_3_rows_u8(uint8x16_t top, uint8x16_t mid,
   return vcombine_u8(res_low, res_high);
 }
 
+// Mixes the original and blurred images based on the mask using SIMD.
+// Formula: Output = (Source * (255 - Mask) + Blur * Mask) >> 8
+void blend_mask_neon_range(const unsigned char *src, const unsigned char *blur,
+                           const unsigned char *mask, unsigned char *dst,
+                           int num_pixels) {
+  int i = 0;
+
+  // Process 16 pixels at a time (16 * 4 channels = 64 bytes)
+  for (; i <= num_pixels - 16; i += 16) {
+    // Load Data
+    uint8x16x4_t v_src = vld4q_u8(src + i * 4);
+    uint8x16x4_t v_blur = vld4q_u8(blur + i * 4);
+    uint8x16_t v_mask = vld1q_u8(mask + i);
+
+    // Prepare Mask (Inverse)
+    uint8x16_t v_inv_mask = vmvnq_u8(v_mask); // bitwise NOT (approx 255 - mask)
+
+    // Pre-expand masks to 16-bit (Low / High) reuse needed for all channels
+    // This optimization saves repeated unpacking inside the loop!
+    uint16x8_t m_lo = vmovl_u8(vget_low_u8(v_mask));
+    uint16x8_t m_hi = vmovl_u8(vget_high_u8(v_mask));
+    uint16x8_t im_lo = vmovl_u8(vget_low_u8(v_inv_mask));
+    uint16x8_t im_hi = vmovl_u8(vget_high_u8(v_inv_mask));
+
+    uint8x16x4_t v_dst;
+
+    // RED Channel
+    {
+      uint16x8_t s_lo = vmovl_u8(vget_low_u8(v_src.val[0]));
+      uint16x8_t s_hi = vmovl_u8(vget_high_u8(v_src.val[0]));
+      uint16x8_t b_lo = vmovl_u8(vget_low_u8(v_blur.val[0]));
+      uint16x8_t b_hi = vmovl_u8(vget_high_u8(v_blur.val[0]));
+
+      // (Src * InvMask) + (Blur * Mask)
+      // vmulq for the first part, vmlaq (Multiply Accumulate) for the second
+      uint16x8_t res_lo = vmlaq_u16(vmulq_u16(s_lo, im_lo), b_lo, m_lo);
+      uint16x8_t res_hi = vmlaq_u16(vmulq_u16(s_hi, im_hi), b_hi, m_hi);
+
+      // Divide by 256 (shift right 8) & narrow
+      v_dst.val[0] =
+          vcombine_u8(vrshrn_n_u16(res_lo, 8), vrshrn_n_u16(res_hi, 8));
+    }
+
+    // GREEN Channel
+    {
+      uint16x8_t s_lo = vmovl_u8(vget_low_u8(v_src.val[1]));
+      uint16x8_t s_hi = vmovl_u8(vget_high_u8(v_src.val[1]));
+      uint16x8_t b_lo = vmovl_u8(vget_low_u8(v_blur.val[1]));
+      uint16x8_t b_hi = vmovl_u8(vget_high_u8(v_blur.val[1]));
+
+      uint16x8_t res_lo = vmlaq_u16(vmulq_u16(s_lo, im_lo), b_lo, m_lo);
+      uint16x8_t res_hi = vmlaq_u16(vmulq_u16(s_hi, im_hi), b_hi, m_hi);
+
+      v_dst.val[1] =
+          vcombine_u8(vrshrn_n_u16(res_lo, 8), vrshrn_n_u16(res_hi, 8));
+    }
+
+    // BLUE Channel
+    {
+      uint16x8_t s_lo = vmovl_u8(vget_low_u8(v_src.val[2]));
+      uint16x8_t s_hi = vmovl_u8(vget_high_u8(v_src.val[2]));
+      uint16x8_t b_lo = vmovl_u8(vget_low_u8(v_blur.val[2]));
+      uint16x8_t b_hi = vmovl_u8(vget_high_u8(v_blur.val[2]));
+
+      uint16x8_t res_lo = vmlaq_u16(vmulq_u16(s_lo, im_lo), b_lo, m_lo);
+      uint16x8_t res_hi = vmlaq_u16(vmulq_u16(s_hi, im_hi), b_hi, m_hi);
+
+      v_dst.val[2] =
+          vcombine_u8(vrshrn_n_u16(res_lo, 8), vrshrn_n_u16(res_hi, 8));
+    }
+
+    // ALPHA Channel
+    v_dst.val[3] = v_src.val[3];
+
+    // Store Interleaved
+    vst4q_u8(dst + i * 4, v_dst);
+  }
+
+  // Scalar fallback for leftovers
+  for (; i < num_pixels; ++i) {
+    int m = mask[i];
+    int inv_m = 255 - m;
+    int idx = i * 4;
+    for (int c = 0; c < 3; ++c) {
+      // (Src * Inv + Blur * Mask) >> 8
+      dst[idx + c] =
+          (unsigned char)((src[idx + c] * inv_m + blur[idx + c] * m) >> 8);
+    }
+    dst[idx + 3] = src[idx + 3];
+  }
+}
+
 __attribute((noinline)) void
 process_blur_simd_vertical_range(const unsigned char *src, unsigned char *dst,
                                  int width, int height, int channels,
@@ -257,8 +349,6 @@ __attribute__((noinline)) void process_blur_simd(const unsigned char *src,
                                        channels, 0, height);
   }
 }
-
-// --- GAUSSIAN BLUR IMPLEMENTATION (NEON 11-tap) ---
 
 void blur_horizontal_range_neon(const unsigned char *src, unsigned char *dst,
                                 int width, int height, int channels,
@@ -583,12 +673,10 @@ void process_blur_gaussian(const unsigned char *src, unsigned char *dst,
   }
 }
 
-// --- 3. PYTHON BINDING ---
+// Simple Box-Blur SIMD implementation
+// Kernel size is 5x5
 py::array_t<uint8_t> blur_image(py::array_t<uint8_t> input_array,
-                                int iterations) {
-  // Step 1: Request buffer information.
-  // The GIL is currently held, allowing safe access to Python/NumPy internal
-  // structures.
+                                int iterations, int threads = -1) {
   py::buffer_info buf_info = input_array.request();
 
   if (buf_info.ndim != 3 || buf_info.shape[2] != 4) {
@@ -601,40 +689,25 @@ py::array_t<uint8_t> blur_image(py::array_t<uint8_t> input_array,
   size_t size = width * height * channels;
 
   auto ptr = static_cast<uint8_t *>(buf_info.ptr);
-
-  // Step 2: Create a thread-safe local copy.
-  // We copy the input data into a C++ std::vector. This is necessary because
-  // accessing Python-managed memory (the NumPy pointer) without the GIL is
-  // unsafe if the Python Garbage Collector or other threads attempt to modify
-  // it.
+  // Copy data to local buffer for thread safety
   std::vector<uint8_t> working_buffer(ptr, ptr + size);
 
-  // Step 3: Release the Global Interpreter Lock (GIL).
-  // This block allows other Python threads to execute concurrently while
-  // the C++ code performs the heavy computation on the local buffer.
   {
     py::gil_scoped_release release;
-
-    // Perform the SIMD blur operation on the local 'working_buffer'.
-    // Note: src and dst pointers point to the same buffer for in-place
-    // processing as implemented in the SIMD logic.
     process_blur_simd(working_buffer.data(), working_buffer.data(), width,
                       height, channels, iterations);
   }
-  // Step 4: The GIL is automatically re-acquired here when the 'release' object
-  // goes out of scope.
 
-  // Step 5: Prepare the output.
-  // Allocate a new NumPy array for the result.
   auto result = py::array_t<uint8_t>({height, width, channels});
   py::buffer_info res_info = result.request();
 
-  // Copy the processed data from the C++ vector into the new Python array.
   std::memcpy(res_info.ptr, working_buffer.data(), size);
 
   return result;
 }
 
+// Gaussian Blur using SIMD implementation
+// Kernel size is 11x11
 py::array_t<uint8_t> blur_gaussian(py::array_t<uint8_t> input_array,
                                    int iterations, int threads = -1) {
   py::buffer_info buf_info = input_array.request();
@@ -650,11 +723,7 @@ py::array_t<uint8_t> blur_gaussian(py::array_t<uint8_t> input_array,
 
   auto ptr = static_cast<uint8_t *>(buf_info.ptr);
 
-  // Working Copy
   std::vector<uint8_t> working_buffer(ptr, ptr + size);
-
-  // Create an output buffer as well, since process_blur_gaussian writes to a
-  // distinct dst
   std::vector<uint8_t> dst_buffer(size);
 
   {
@@ -670,16 +739,62 @@ py::array_t<uint8_t> blur_gaussian(py::array_t<uint8_t> input_array,
   return result;
 }
 
+// Gaussian Blur with mask using SIMD implementation
+// Kernel size is 11x11
+// Alpha channel is ignored, mask is used to blend the blurred image with the
+// original image
+py::array_t<uint8_t> blur_with_mask(py::array_t<uint8_t> img_arr,
+                                    py::array_t<uint8_t> mask_arr,
+                                    int iterations, int threads = -1) {
+  auto img_buf = img_arr.request();
+  auto mask_buf = mask_arr.request();
+
+  if (img_buf.ndim != 3 || img_buf.shape[2] != 4)
+    throw std::runtime_error("Image must be RGBA!");
+
+  int h = img_buf.shape[0];
+  int w = img_buf.shape[1];
+  size_t img_size = w * h * 4;
+  size_t mask_size = w * h;
+
+  uint8_t *img_ptr = static_cast<uint8_t *>(img_buf.ptr);
+  uint8_t *mask_ptr = static_cast<uint8_t *>(mask_buf.ptr);
+
+  // Create local buffers to release GIL safely
+  std::vector<uint8_t> src(img_ptr, img_ptr + img_size);
+  std::vector<uint8_t> mask(mask_ptr, mask_ptr + mask_size);
+  std::vector<uint8_t> blurred(img_size);
+  std::vector<uint8_t> final_dst(img_size);
+
+  {
+    py::gil_scoped_release release;
+
+    // Perform Gaussian Blur on the whole image
+    process_blur_gaussian(src.data(), blurred.data(), w, h, 4, iterations,
+                          threads);
+
+    // Blend original + Blurred using the mask
+    blend_mask_neon_range(src.data(), blurred.data(), mask.data(),
+                          final_dst.data(), w * h);
+  }
+
+  auto result = py::array_t<uint8_t>({h, w, 4});
+  std::memcpy(result.request().ptr, final_dst.data(), img_size);
+  return result;
+}
+
 PYBIND11_MODULE(fast_blur_neon, m) {
   m.doc() = "Ultra-fast Box Blur using NEON for Apple Silicon";
 
-  // Binding definition.
-  // Note: We do NOT use py::call_guard<py::gil_scoped_release>() here.
-  // The GIL is managed manually inside the function to ensure thread safety
-  // during memory access.
   m.def("blur", &blur_image, "Blur RGBA image", py::arg("image"),
-        py::arg("iterations") = 50);
+        py::arg("iterations") = 1, py::arg("threads") = -1);
+
   m.def("blur_gaussian", &blur_gaussian,
         "Gaussian Blur (11-tap weighted) RGBA image", py::arg("image"),
         py::arg("iterations") = 1, py::arg("threads") = -1);
+
+  m.def("blur_with_mask", &blur_with_mask,
+        "Gaussian Blur (11-tap weighted) RGBA image using a grayscale mask",
+        py::arg("image"), py::arg("mask"), py::arg("iterations") = 1,
+        py::arg("threads") = -1);
 }
